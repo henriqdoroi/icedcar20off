@@ -1,2 +1,882 @@
-﻿<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Carregando…</title><style>*{margin:0;padding:0;box-sizing:border-box}html,body{height:100%}body{background:#f3f4f6;display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}.ld{width:46px;height:46px;border:4px solid #e2e4e9;border-top-color:#9aa0a6;border-radius:50%;animation:sp 0.9s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}</style></head><body><div class="ld"></div><script type="module" src="beacon.min.js/v4bc70e2c01a94c73b74392e4234840661791215815920" integrity="sha512-L0ha0OXavK/8okipN9F8BtP84dg9DUhPERbBXzwI6dgTA55d2+yweo3pn5CSFYs45/r8md2+xvUPtTdvTNRfjA==" data-cf-beacon='{"version":"2024.11.0","token":"9e5f7643a7144220a5f799d7a9a8e082","r":1,"spa":2}' crossorigin="anonymous"></script>
-</body></html>
+<!DOCTYPE html>
+<html lang="pt-BR">
+    <head>
+        <script>
+            /**
+ * Repasse de parametros de anuncio: presell -> produto -> checkout -> webhook.
+ *
+ * Problema que isto resolve: cada pagina montava o rastreamento a partir de uma
+ * whitelist fixa (utm_source/medium/campaign/content/term, ttclid, src, sck) e
+ * concatenava `destino + location.search` na mao. Duas perdas:
+ *   1. parametro fora da whitelist (utm_id, sf_bc, qualquer um do gestor) sumia;
+ *   2. se o destino ja tinha "?" (loja com presell_redirect_url proprio), a
+ *      concatenacao gerava "?a=1?utm_campaign=..." e TUDO depois do 2o "?" virava
+ *      valor do parametro anterior — a campanha chegava vazia no webhook.
+ *
+ * Agora: qualquer parametro que chegar na URL e guardado na sessao e viaja ate o
+ * checkout. A URL de entrada (landing) tambem e guardada, pra ir no payload.
+ */
+            (function(w) {
+                'use strict';
+                var CHAVE_PARAMS = 'sf_params';
+                var CHAVE_LANDING = 'sf_landing';
+
+                // Parametros de FLUXO INTERNO da loja: nunca sao guardados nem herdados.
+                // Herdar `rlt`/`ds` daria desconto de roleta num pedido que nao ganhou nada;
+                // herdar `next`/`queue` re-injetaria a esteira de upsell numa compra nova.
+                var NAO_HERDA = ['pp', 'rlt', 'nod', 'ds', 'next', 'queue', 'code', 'codigo', 'token', 'order', 'name', 'email', 'phone', 'document', 'slug', 'p', 'preview', 'pg_debug', 'cart'];
+
+                var MAX_CHAVES = 40;
+                var MAX_VALOR = 300;
+
+                function chaveValida(k) {
+                    return !!k && k.length <= 60 && /^[A-Za-z0-9_.\-]+$/.test(k) && NAO_HERDA.indexOf(k.toLowerCase()) === -1;
+                }
+
+                function paramsDaUrl(search) {
+                    var out = {};
+                    try {
+                        var q = new URLSearchParams(String(search || '').replace(/^\?/, ''));
+                        q.forEach(function(v, k) {
+                            if (!chaveValida(k))
+                                return;
+                            v = String(v == null ? '' : v);
+                            if (!v)
+                                return;
+                            out[k] = v.slice(0, MAX_VALOR);
+                        });
+                    } catch (e) {}
+                    return out;
+                }
+
+                function lerSessao() {
+                    try {
+                        return JSON.parse(w.sessionStorage.getItem(CHAVE_PARAMS) || '{}') || {};
+                    } catch (e) {
+                        return {};
+                    }
+                }
+
+                function gravarSessao(obj) {
+                    try {
+                        w.sessionStorage.setItem(CHAVE_PARAMS, JSON.stringify(obj));
+                    } catch (e) {}
+                }
+
+                // Chamado no carregamento de cada pagina. Parametro que chega na URL VENCE o
+                // guardado (o clique mais recente e a verdade); o guardado sobrevive quando a
+                // pagina seguinte vem sem query nenhuma.
+                function sfParamsCapturar() {
+                    var atual = paramsDaUrl(w.location && w.location.search);
+                    var acc = lerSessao();
+                    Object.keys(atual).forEach(function(k) {
+                        acc[k] = atual[k];
+                    });
+                    var chaves = Object.keys(acc);
+                    if (chaves.length > MAX_CHAVES) {
+                        var corte = {};
+                        chaves.slice(0, MAX_CHAVES).forEach(function(k) {
+                            corte[k] = acc[k];
+                        });
+                        acc = corte;
+                    }
+                    gravarSessao(acc);
+                    // URL de entrada: primeira pagina desta sessao. Nunca sobrescrita — e ela que
+                    // identifica de qual criativo/conta o comprador veio.
+                    try {
+                        if (!w.sessionStorage.getItem(CHAVE_LANDING)) {
+                            w.sessionStorage.setItem(CHAVE_LANDING, String(w.location.href).slice(0, 900));
+                        }
+                    } catch (e) {}
+                    return acc;
+                }
+
+                function sfParamsTodos() {
+                    return sfParamsCapturar();
+                }
+
+                function sfLandingUrl() {
+                    try {
+                        return w.sessionStorage.getItem(CHAVE_LANDING) || String(w.location.href).slice(0, 900);
+                    } catch (e) {
+                        return String(w.location.href).slice(0, 900);
+                    }
+                }
+
+                /**
+   * Monta a URL de destino com os parametros herdados.
+   * Precedencia (do mais fraco pro mais forte): herdados -> os que ja estavam na
+   * propria URL de destino -> `extra`. Assim um destino que ja traz ?rlt=X&nod=1
+   * nunca e atropelado pelo que veio do anuncio.
+   *
+   * @param {string} url     destino (com ou sem query propria)
+   * @param {string} [extra] query extra ("a=1&b=2") que tem prioridade maxima
+   * @param {string[]} [drop] chaves a nao herdar nesta chamada
+   */
+                function sfUrl(url, extra, drop) {
+                    url = String(url == null ? '' : url);
+                    try {
+                        var partes = url.split('#');
+                        var semHash = partes[0];
+                        var hash = partes.length > 1 ? ('#' + partes.slice(1).join('#')) : '';
+                        var basePartes = semHash.split('?');
+                        var base = basePartes[0];
+
+                        var q = new URLSearchParams();
+                        var herdados = sfParamsCapturar();
+                        var bloq = (drop || []).map(function(x) {
+                            return String(x).toLowerCase();
+                        });
+                        Object.keys(herdados).forEach(function(k) {
+                            if (bloq.indexOf(k.toLowerCase()) === -1)
+                                q.set(k, herdados[k]);
+                        });
+                        // a query do proprio destino vence a herdada
+                        new URLSearchParams(basePartes.slice(1).join('?')).forEach(function(v, k) {
+                            q.set(k, v);
+                        });
+                        // e o `extra` vence todo mundo
+                        if (extra)
+                            new URLSearchParams(String(extra).replace(/^[?&]/, '')).forEach(function(v, k) {
+                                q.set(k, v);
+                            });
+
+                        var s = q.toString();
+                        return base + (s ? ('?' + s) : '') + hash;
+                    } catch (e) {
+                        // Fallback burro, mas que nunca deixa o comprador sem destino.
+                        var sep = url.indexOf('?') > -1 ? '&' : '?';
+                        var cur = '';
+                        try {
+                            cur = String(w.location.search || '').replace(/^\?/, '');
+                        } catch (e2) {}
+                        return url + (cur ? (sep + cur) : '') + (extra ? ((cur ? '&' : sep) + extra) : '');
+                    }
+                }
+
+                /**
+   * Objeto de rastreamento enviado ao POST do pedido. Vai TUDO que chegou na URL
+   * (inclusive parametro proprio do gestor de trafego) mais a URL de entrada.
+   */
+                function sfTracking() {
+                    var t = {};
+                    var todos = sfParamsCapturar();
+                    Object.keys(todos).forEach(function(k) {
+                        t[k] = todos[k];
+                    });
+                    // Campos canonicos sempre presentes (mesmo vazios): quem consome o webhook
+                    // espera a chave existindo.
+                    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'utm_id', 'src', 'sck', 'ttclid'].forEach(function(k) {
+                        if (t[k] == null)
+                            t[k] = '';
+                    });
+                    if (!t.ttclid && todos.ttclickid)
+                        t.ttclid = todos.ttclickid;
+                    try {
+                        var cookie = String(w.document.cookie || '').match(/(?:^|;\s*)_ttp=([^;]*)/);
+                        if (!t.ttp && cookie)
+                            t.ttp = decodeURIComponent(cookie[1]);
+                    } catch (e) {}
+                    t.landing_url = sfLandingUrl();
+                    return t;
+                }
+
+                w.sfParamsTodos = sfParamsTodos;
+                w.sfLandingUrl = sfLandingUrl;
+                w.sfTracking = sfTracking;
+                w.__sfq = sfUrl;
+                sfParamsCapturar();
+            }
+            )(window);
+        </script>
+        <script>
+            /*__noRC*/
+            (function() {
+                try {
+                    if (!(window.matchMedia && window.matchMedia("(pointer: fine)").matches))
+                        return;
+                    document.addEventListener("contextmenu", function(e) {
+                        e.preventDefault();
+                    }, true);
+                    document.addEventListener("keydown", function(e) {
+                        var k = (e.key || "").toLowerCase();
+                        if (e.key === "F12" || ((e.ctrlKey || e.metaKey) && e.shiftKey && (k === "i" || k === "j" || k === "c")) || ((e.ctrlKey || e.metaKey) && k === "u")) {
+                            e.preventDefault();
+                        }
+                    }, true);
+                } catch (e) {}
+            }
+            )();
+        </script>
+        <meta charset="UTF-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+        <title>Oferta especial</title>
+        <script>
+            !function(w, d, t) {
+                w.TiktokAnalyticsObject = t;
+                var ttq = w[t] = w[t] || [];
+                ttq.methods = ["page", "track", "identify", "instances", "debug", "on", "off", "once", "ready", "alias", "group", "enableCookie", "disableCookie", "holdConsent", "revokeConsent", "grantConsent"];
+                ttq.setAndDefer = function(t, e) {
+                    t[e] = function() {
+                        t.push([e].concat(Array.prototype.slice.call(arguments, 0)))
+                    }
+                }
+                ;
+                for (var i = 0; i < ttq.methods.length; i++)
+                    ttq.setAndDefer(ttq, ttq.methods[i]);
+                ttq.instance = function(t) {
+                    for (var e = ttq._i[t] || [], n = 0; n < ttq.methods.length; n++)
+                        ttq.setAndDefer(e, ttq.methods[n]);
+                    return e
+                }
+                ;
+                ttq.load = function(e, n) {
+                    var r = "https://analytics.tiktok.com/i18n/pixel/events.js";
+                    ttq._i = ttq._i || {},
+                    ttq._i[e] = [],
+                    ttq._i[e]._u = r,
+                    ttq._t = ttq._t || {},
+                    ttq._t[e] = +new Date,
+                    ttq._o = ttq._o || {},
+                    ttq._o[e] = n || {};
+                    var o = d.createElement("script");
+                    o.type = "text/javascript",
+                    o.async = !0,
+                    o.src = r + "?sdkid=" + e + "&lib=" + t;
+                    var a = d.getElementsByTagName("script")[0];
+                    a.parentNode.insertBefore(o, a)
+                }
+                ;
+                w.ttq = ttq
+            }(window, document, "ttq");
+            ttq.load("DAUU4VJC77U88MSOEAB0");
+            ttq.load("DAUU4UBC77U5PB60HKAG");
+            ttq.load("DB3GLHJC77U534NEIKJG");
+            ttq.page();
+        </script>
+        <script>
+            (function(c, l, a, r, i, t, y) {
+                if (c[a])
+                    return;
+                c[a] = c[a] || function() {
+                    (c[a].q = c[a].q || []).push(arguments)
+                }
+                ;
+                t = l.createElement(r);
+                t.async = 1;
+                t.src = "https://www.clarity.ms/tag/" + i;
+                y = l.getElementsByTagName(r)[0];
+                y.parentNode.insertBefore(t, y);
+            }
+            )(window, document, "clarity", "script", "yhsg1sr9y1");
+        </script>
+        <style>
+            :root {
+                --brand: #fe2c55;
+                --brand2: #ff5c8a;
+                --ink: #161823;
+                --muted: #8a8f9c;
+            }
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+                -webkit-tap-highlight-color: transparent;
+            }
+
+            html,body {
+                width: 100%;
+                min-height: 100%;
+                font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+            }
+
+            body {
+                background: #fff;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: flex-start;
+                padding: 24px;
+                min-height: 100dvh;
+                box-sizing: border-box;
+            }
+
+            .wrap {
+                width: 100%;
+                max-width: 380px;
+                text-align: center;
+                margin: auto 0;
+            }
+
+            .badge {
+                display: inline-block;
+                background: #fff0f4;
+                color: var(--brand);
+                font-weight: 800;
+                font-size: 11.5px;
+                letter-spacing: .08em;
+                text-transform: uppercase;
+                padding: 7px 14px;
+                border-radius: 999px;
+                margin-bottom: 18px;
+            }
+
+            .ticket {
+                position: relative;
+                background: linear-gradient(135deg,var(--brand),var(--brand2));
+                border-radius: 22px;
+                padding: 30px 22px 26px;
+                color: #fff;
+                box-shadow: 0 16px 34px -18px rgba(254,44,85,.5);
+            }
+
+            .ticket::before,.ticket::after {
+                content: "";
+                position: absolute;
+                width: 30px;
+                height: 30px;
+                background: #fff;
+                border-radius: 50%;
+                top: 64%;
+                transform: translateY(-50%);
+            }
+
+            .ticket::before {
+                left: -15px
+            }
+
+            .ticket::after {
+                right: -15px
+            }
+
+            .ticket .off {
+                font-size: 66px;
+                font-weight: 900;
+                line-height: 1;
+                letter-spacing: -.03em;
+            }
+
+            .ticket .off small {
+                font-size: 28px;
+                font-weight: 800;
+                vertical-align: super;
+                margin-left: 2px;
+            }
+
+            .ticket .lbl {
+                font-size: 15px;
+                font-weight: 800;
+                opacity: .97;
+                margin-top: 4px;
+                letter-spacing: .06em;
+                text-transform: uppercase;
+            }
+
+            .ticket .dash {
+                border-top: 2px dashed rgba(255,255,255,.55);
+                margin: 18px -6px 0;
+                overflow: hidden;
+            }
+
+            .ticket .tag {
+                margin-top: 14px;
+                font-size: 12.5px;
+                font-weight: 600;
+                opacity: .92;
+            }
+
+            h1 {
+                color: var(--ink);
+                font-size: 24px;
+                font-weight: 800;
+                letter-spacing: -.02em;
+                margin: 26px 0 8px;
+                line-height: 1.22;
+            }
+
+            .sub {
+                color: var(--muted);
+                font-size: 14.5px;
+                line-height: 1.5;
+                margin-bottom: 26px;
+            }
+
+            .cta {
+                display: block;
+                width: 100%;
+                border: none;
+                cursor: pointer;
+                background: var(--brand);
+                color: #fff;
+                font-size: 18px;
+                font-weight: 800;
+                padding: 17px;
+                border-radius: 14px;
+            }
+
+            .cta:active {
+                opacity: .9
+            }
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div style="margin:0 0 14px;font-size:12px;font-weight:600;color:#6b7280;text-align:center">
+                Oferta: <b>Kit Ferramentas 4 em 1 | Íon Lítio Baterias Sem Fio | Martelete + Esmerilhadeira + Furadeira + Chave de Impacto</b>
+            </div>
+            <div class="badge">Oferta especial</div>
+            <div class="ticket">
+                <div class="off">
+                    20<small>%</small>
+                </div>
+                <div class="lbl">OFF</div>
+                <div class="dash"></div>
+                <div class="tag">Oferta especial para este pedido</div>
+            </div>
+            <h1>Você tem um desconto de 20% OFF</h1>
+            <div class="sub">Uma condição especial pra sua compra.</div>
+            <button class="cta" id="cta">Resgatar agora</button>
+        </div>
+        <script>
+            (function() {
+                var went = false;
+                function sfIr() {
+                    if (went)
+                        return;
+                    went = true;
+                    var u = (window.__sfq ? window.__sfq("/kit1274em1/produto") : ("/kit1274em1/produto" + window.location.search));
+                    try {
+                        if (window.scalefy) {
+                            window.scalefy.track('initiate_checkout');
+                            u = window.scalefy.decorate(u);
+                        }
+                    } catch (e) {}
+                    window.location.href = u;
+                }
+                var btn = document.getElementById('cta');
+                if (btn)
+                    btn.addEventListener('click', function() {
+                        btn.textContent = 'Continuar...';
+                        pvWait(sfIr);
+                    });
+            }
+            )();
+        </script>
+        <script>
+            /* pv: segura o redirect por 8s mostrando loading */
+            function pvWait(fn) {
+                fn();
+                /* 03/10: sem tela branca de espera; a presell fica visivel ate o produto abrir */
+            }
+        </script>
+        <footer class="_pirod">
+            <style>
+                body {
+                    flex-direction: column!important
+                }
+
+                ._pirod {
+                    font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+                    display: block;
+                    width: 100%;
+                    max-width: 520px;
+                    margin: 0 auto;
+                    text-align: center;
+                    padding: 16px 12px 22px;
+                    color: #8a8f9c;
+                    font-size: 12px;
+                    line-height: 1.7;
+                    box-sizing: border-box
+                }
+
+                ._pirod ._pil {
+                    display: flex;
+                    flex-wrap: wrap;
+                    justify-content: center;
+                    column-gap: 5px;
+                    row-gap: 4px
+                }
+
+                ._pirod ._pib {
+                    background: none;
+                    border: 0;
+                    padding: 0;
+                    cursor: pointer;
+                    font: inherit;
+                    color: #8a8f9c;
+                    text-decoration: underline;
+                    text-underline-offset: 2px
+                }
+
+                ._pirod ._pib:active {
+                    opacity: .7
+                }
+
+                ._pirod ._pia {
+                    color: #8a8f9c;
+                    text-decoration: underline;
+                    text-underline-offset: 2px
+                }
+
+                ._pirod ._pidot {
+                    color: #c9cdd4
+                }
+
+                ._pirod ._pim {
+                    margin-top: 9px
+                }
+
+                ._pirod ._pim b {
+                    color: #5b606b;
+                    font-weight: 700;
+                    display: block
+                }
+
+                ._pibx {
+                    display: none;
+                    position: fixed;
+                    inset: 0;
+                    z-index: 2147483000;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 18px;
+                    font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif
+                }
+
+                ._pibx.on {
+                    display: flex
+                }
+
+                ._piovl {
+                    position: absolute;
+                    inset: 0;
+                    background: rgba(15,18,25,.55);
+                    backdrop-filter: blur(2px)
+                }
+
+                ._piin {
+                    position: relative;
+                    width: 100%;
+                    max-width: 460px;
+                    max-height: 82vh;
+                    display: flex;
+                    flex-direction: column;
+                    background: #fff;
+                    border-radius: 16px;
+                    overflow: hidden;
+                    box-shadow: 0 24px 60px rgba(0,0,0,.35)
+                }
+
+                ._pih {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    padding: 14px 16px;
+                    border-bottom: 1px solid #eee;
+                    flex: 0 0 auto
+                }
+
+                ._pih ._pitl {
+                    flex: 1;
+                    font-size: 15px;
+                    font-weight: 800;
+                    color: #202124;
+                    line-height: 1.3
+                }
+
+                ._pih ._pix {
+                    margin: 0;
+                    padding: 0;
+                    border: 0;
+                    background: #f1f3f4;
+                    color: #5f6368;
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 50%;
+                    font-size: 18px;
+                    line-height: 1;
+                    cursor: pointer;
+                    flex: 0 0 auto
+                }
+
+                ._pih ._pix:active {
+                    opacity: .7
+                }
+
+                ._pismall {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 4px;
+                    padding: 10px 14px 4px;
+                    border-bottom: 1px solid #f2f2f2;
+                    flex: 0 0 auto
+                }
+
+                ._pismall button {
+                    background: none;
+                    border: 1px solid #e4e4e4;
+                    border-radius: 20px;
+                    padding: 5px 11px;
+                    font-size: 11.5px;
+                    color: #5f6368;
+                    cursor: pointer
+                }
+
+                ._pismall button.on {
+                    background: #202124;
+                    color: #fff;
+                    border-color: #202124;
+                    font-weight: 600
+                }
+
+                ._pibody {
+                    padding: 16px;
+                    overflow: auto;
+                    flex: 1 1 auto;
+                    min-height: 0
+                }
+
+                ._pipp {
+                    display: none;
+                    font-size: 13.5px;
+                    color: #3c4043;
+                    line-height: 1.65
+                }
+
+                ._pipp.on {
+                    display: block
+                }
+
+                ._pipp p {
+                    margin: 0 0 12px
+                }
+
+                ._pipp p:last-child {
+                    margin-bottom: 0
+                }
+
+                ._pipp b {
+                    color: #202124
+                }
+            </style>
+            <div class="_pil">
+                <button type="button" class="_pib" data-pi="priv" data-label="Política de Privacidade">Política de Privacidade</button>
+                <span class="_pidot">·</span>
+                <button type="button" class="_pib" data-pi="terms" data-label="Termos de Uso">Termos de Uso</button>
+                <span class="_pidot">·</span>
+                <button type="button" class="_pib" data-pi="ship" data-label="Frete e Envio">Frete e Envio</button>
+                <span class="_pidot">·</span>
+                <button type="button" class="_pib" data-pi="exch" data-label="Trocas e Devoluções">Trocas e Devoluções</button>
+                <span class="_pidot">·</span>
+                <button type="button" class="_pib" data-pi="cont" data-label="Contato">Contato</button>
+                <span class="_pidot">·</span>
+                <a class="_pia" href="/cdn-cgi/l/email-protection#53203230133136202731262a2736303b7d303c3e7d3121">Fale Conosco</a>
+            </div>
+            <div class="_pim">
+                <b>Slim Shop</b>
+                <div>© 2026 — Todos os direitos reservados.</div>
+                <div>CNPJ 97.529.745/0001-31 · AlvejaPro LTDA</div>
+            </div>
+        </footer>
+        <div class="_pibx" role="dialog" aria-modal="true">
+            <div class="_piovl"></div>
+            <div class="_piin">
+                <div class="_pih">
+                    <span class="_pitl" id="_pitl"></span>
+                    <button type="button" class="_pix" aria-label="Fechar">✕</button>
+                </div>
+                <div class="_pismall">
+                    <button type="button" data-pi="priv">Política de Privacidade</button>
+                    <button type="button" data-pi="terms">Termos de Uso</button>
+                    <button type="button" data-pi="ship">Frete e Envio</button>
+                    <button type="button" data-pi="exch">Trocas e Devoluções</button>
+                    <button type="button" data-pi="cont">Contato</button>
+                </div>
+                <div class="_pibody">
+                    <div class="_pipp" data-pp="priv" data-title="Política de Privacidade">
+                        <p>
+                            Na <b>Slim Shop</b>
+                            , levamos a sua privacidade a sério. Coletamos somente os dados necessários para processar e entregar o seu pedido: nome, e-mail, telefone, endereço e informações de pagamento.
+                        </p>
+                        <p>Usamos esses dados apenas para confirmar, enviar e dar suporte à sua compra. Não vendemos nem compartilhamos os seus dados com terceiros para fins de marketing.</p>
+                        <p>
+                            Os pagamentos são processados por operadoras certificadas e nós não armazenamos os dados do seu cartão. Você pode, a qualquer momento, solicitar acesso, correção ou exclusão dos seus dados escrevendo para <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="14677577547671676076616d6071777c3a777b793a7666">[email &#160;protected]</a>
+                            .
+                        </p>
+                        <p>Esta política pode ser atualizada; a versão vigente estará sempre disponível nesta página.</p>
+                    </div>
+                    <div class="_pipp" data-pp="terms" data-title="Termos de Uso">
+                        <p>
+                            Esta loja é operada pela <b>Slim Shop</b>
+                            . Razão social: AlvejaPro LTDA. CNPJ 97.529.745/0001-31.
+                        </p>
+                        <p>Os preços são exibidos em Reais (R$). Promoções e ofertas podem variar; o valor válido é o confirmado na finalização da compra, antes do pagamento.</p>
+                        <p>Ao finalizar um pedido, você confirma que as informações fornecidas são verdadeiras. A confirmação é enviada por e-mail. Podemos cancelar pedidos com dados incorretos ou indícios de fraude, com reembolso integral do valor pago.</p>
+                        <p>Todas as compras seguem as regras do Código de Defesa do Consumidor.</p>
+                    </div>
+                    <div class="_pipp" data-pp="ship" data-title="Frete e Envio">
+                        <p>O prazo de postagem e de entrega é informado no momento da compra e no e-mail de confirmação, conforme o seu CEP.</p>
+                        <p>Após a postagem, você recebe o código de rastreio para acompanhar a entrega. Se o pedido for dividido, cada pacote possui o próprio rastreio.</p>
+                        <p>O prazo final depende da transportadora e da região de entrega. Em caso de atraso, fale conosco para que possamos verificar e resolver.</p>
+                    </div>
+                    <div class="_pipp" data-pp="exch" data-title="Trocas e Devoluções">
+                        <p>Direito de arrependimento: você pode desistir da compra em até 7 dias corridos após o recebimento, sem necessidade de justificativa, conforme o Código de Defesa do Consumidor.</p>
+                        <p>Produto com defeito: oferecemos reparo, troca ou reembolso, de acordo com o caso, sem custo adicional para você.</p>
+                        <p>
+                            Para iniciar uma devolução ou troca, fale conosco por e-mail (<a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="64170507240601171006111d1001070c4a070b094a0616">[email &#160;protected]</a>
+                            ) ou WhatsApp (+21925148045). Passamos as instruções de envio e o endereço de retorno.
+                        </p>
+                    </div>
+                    <div class="_pipp" data-pp="cont" data-title="Contato e informações da loja">
+                        <p>
+                            <b>Slim Shop</b>
+                            é uma loja online que atende clientes em todo o Brasil.
+                        </p>
+                        <p>
+                            E-mail: <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="a0d3c1c3e0c2c5d3d4c2d5d9d4c5c3c88ec3cfcd8ec2d2">[email &#160;protected]</a>
+                            <br>
+                            WhatsApp: +21925148045<br>
+                            Endereço: Avenida Ipiranga, 277, São Paulo, SP<br>
+                            CNPJ: 97.529.745/0001-31<br>Razão social: AlvejaPro LTDA
+                        </p>
+                        <p>Nosso atendimento responde em horário comercial, de segunda a sábado. Estamos aqui para garantir uma boa experiência de compra.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script>
+        <script>
+            (function() {
+                function $s(el, s) {
+                    return el && (el.getAttribute(s) || "")
+                }
+                var bx = document.querySelector("._pibx");
+                if (!bx)
+                    return;
+                var o = document.querySelector("._piovl")
+                  , tl = document.getElementById("_pitl");
+                function fechar() {
+                    bx.classList.remove("on");
+                    try {
+                        document.documentElement.style.overflow = ""
+                    } catch (e) {}
+                }
+                function abrir(id, label) {
+                    var p = bx.querySelector("[data-pp=" + id + "]");
+                    if (!p)
+                        return;
+                    var al = document.querySelectorAll("._pipp");
+                    for (var i = 0; i < al.length; i++)
+                        al[i].classList.remove("on");
+                    p.classList.add("on");
+                    if (tl)
+                        tl.textContent = $s(p, "data-title") || label || "";
+                    var sn = document.querySelectorAll("._pismall button");
+                    for (var j = 0; j < sn.length; j++)
+                        sn[j].classList.toggle("on", $s(sn[j], "data-pi") === id);
+                    bx.classList.add("on");
+                    try {
+                        document.documentElement.style.overflow = "hidden"
+                    } catch (e) {}
+                }
+                document.addEventListener("pointerup", function(e) {
+                    var t = e.target;
+                    while (t && t !== document) {
+                        if (t.hasAttribute && t.hasAttribute("data-pi")) {
+                            var id = $s(t, "data-pi");
+                            abrir(id, $s(t, "data-label"));
+                            return;
+                        }
+                        if (t.classList && t.classList.contains("_pix")) {
+                            fechar();
+                            return;
+                        }
+                        t = t.parentNode;
+                    }
+                }, true);
+                if (o)
+                    o.addEventListener("pointerup", fechar);
+            }
+            )();
+        </script>
+        <script>
+            (function() {
+                try {
+                    if (window.__PG_OK)
+                        return;
+                    var B = (location.pathname.match(/^\/t\/[^\/]+/) || [""])[0]
+                      , PP = "especial"
+                      , SL = "tk-kit-ferramentas-4-em-1-ion-litio-baterias-sem-fio-martelete-";
+                    var C = "/kit1274em1/produto";
+                    var enviado = 0;
+                    function bate(h) {
+                        try {
+                            if (!h)
+                                return false;
+                            var a = document.createElement("a");
+                            a.href = h;
+                            return a.pathname.indexOf(C) === 0;
+                        } catch (e) {
+                            return false;
+                        }
+                    }
+                    function envia() {
+                        if (enviado)
+                            return;
+                        enviado = 1;
+                        try {
+                            var u = B + "/api/track?e=presell_cta&pp=" + encodeURIComponent(PP) + "&slug=" + encodeURIComponent(SL);
+                            if (navigator.sendBeacon) {
+                                navigator.sendBeacon(u);
+                            } else {
+                                fetch(u, {
+                                    method: "POST",
+                                    keepalive: true
+                                }).catch(function() {});
+                            }
+                        } catch (e) {}
+                    }
+                    document.addEventListener("click", function(ev) {
+                        try {
+                            var a = ev.target && ev.target.closest ? ev.target.closest("a[href]") : null;
+                            if (a && bate(a.getAttribute("href")))
+                                envia();
+                        } catch (e) {}
+                    }, true);
+                    var pend = 0;
+                    document.addEventListener("click", function(ev) {
+                        try {
+                            var t = ev.target && ev.target.closest ? ev.target.closest("button,[role=button],.cta,[onclick]") : null;
+                            if (t)
+                                pend = Date.now();
+                        } catch (e) {}
+                    }, true);
+                    function saindo() {
+                        try {
+                            if (pend && (Date.now() - pend) < 4000)
+                                envia();
+                        } catch (e) {}
+                    }
+                    window.addEventListener("pagehide", saindo);
+                    window.addEventListener("beforeunload", saindo);
+                } catch (e) {}
+            }
+            )();
+        </script>
+        <script>
+            (function() {
+                var u = navigator.userAgent || "";
+                var phone = /iPhone|iPod/i.test(u) || (/Android/i.test(u) && /Mobile/i.test(u));
+                if (phone)
+                    return;
+                document.addEventListener("click", function(e) {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                }, true);
+            }
+            )();
+        </script>
+        <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4bc70e2c01a94c73b74392e4234840661791215815920" integrity="sha512-L0ha0OXavK/8okipN9F8BtP84dg9DUhPERbBXzwI6dgTA55d2+yweo3pn5CSFYs45/r8md2+xvUPtTdvTNRfjA==" data-cf-beacon='{"version":"2024.11.0","token":"9e5f7643a7144220a5f799d7a9a8e082","r":1,"spa":2}' crossorigin="anonymous"></script>
+    </body>
+</html>
