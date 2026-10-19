@@ -182,7 +182,7 @@ var e=ttq._i[t]||[],n=0;n<ttq.methods.length;n++)ttq.setAndDefer(e,ttq.methods[n
                     });
                     // Campos canonicos sempre presentes (mesmo vazios): quem consome o webhook
                     // espera a chave existindo.
-                    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'utm_id', 'src', 'sck', 'ttclid'].forEach(function(k) {
+                    ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'utm_id', 'utm_source_platform', 'utm_creative_format', 'utm_marketing_tactic', 'src', 'sck', 'ttclid', 'ttclid', 'ttclickid', 'ttp', 'fbclid', 'fbc', 'fbp', 'gclid', 'gbraid', 'wbraid', 'msclkid', 'twclid', 'li_fat_id', 'epik', 'gad_source', 'campaign_id', 'adset_id', 'ad_id', 'placement', 'network'].forEach(function(k) {
                         if (t[k] == null)
                             t[k] = '';
                     });
